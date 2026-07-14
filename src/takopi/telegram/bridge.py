@@ -15,6 +15,7 @@ from ..model import ResumeToken
 from ..scheduler import ThreadScheduler
 from ..settings import (
     TelegramFilesSettings,
+    TelegramQueueSettings,
     TelegramTopicsSettings,
     TelegramTransportSettings,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "handle_callback_cancel",
     "handle_callback_steer",
     "handle_cancel",
+    "handle_squash",
     "is_cancel_command",
     "run_main_loop",
     "send_with_resume",
@@ -76,7 +78,7 @@ class TelegramPresenter:
         text, entities = prepare_telegram(parts)
         if _is_terminal_progress_label(label):
             reply_markup = CLEAR_MARKUP
-        elif label.strip().lower() == "queued":
+        elif label.strip().lower().startswith("queued"):
             reply_markup = STEER_CANCEL_MARKUP
         else:
             reply_markup = CANCEL_MARKUP
@@ -128,7 +130,7 @@ def _normalized_progress_label(label: str) -> str:
 
 
 def _is_terminal_progress_label(label: str) -> bool:
-    return _normalized_progress_label(label) in {"cancelled", "steered"}
+    return _normalized_progress_label(label) in {"cancelled", "merged", "steered"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +153,7 @@ class TelegramBridgeConfig:
     files: TelegramFilesSettings = field(default_factory=TelegramFilesSettings)
     chat_ids: tuple[int, ...] | None = None
     topics: TelegramTopicsSettings = field(default_factory=TelegramTopicsSettings)
+    queue: TelegramQueueSettings = field(default_factory=TelegramQueueSettings)
 
 
 class TelegramTransport:
@@ -365,6 +368,16 @@ async def handle_cancel(
     from .commands import handle_cancel as _handle_cancel
 
     await _handle_cancel(cfg, msg, running_tasks, scheduler)
+
+
+async def handle_squash(
+    cfg: TelegramBridgeConfig,
+    msg: TelegramIncomingMessage,
+    scheduler: ThreadScheduler | None = None,
+) -> None:
+    from .commands import handle_squash as _handle_squash
+
+    await _handle_squash(cfg, msg, scheduler)
 
 
 async def handle_callback_cancel(

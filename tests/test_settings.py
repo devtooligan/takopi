@@ -30,14 +30,16 @@ def test_load_settings_from_toml(tmp_path: Path) -> None:
 
     assert loaded_path == config_path
     assert settings.transport == "telegram"
-    assert settings.transports.telegram.chat_id == 123
+    telegram = settings.transports.telegram
+    assert telegram is not None
+    assert telegram.chat_id == 123
     assert settings.engine_config("codex", config_path=config_path)["model"] == "gpt-4"
 
     token, chat_id = require_telegram(settings, config_path)
     assert token == "token"
     assert chat_id == 123
 
-    assert settings.transports.telegram.bot_token == "token"
+    assert telegram.bot_token == "token"
 
 
 def test_env_overrides_toml(tmp_path: Path, monkeypatch) -> None:
@@ -64,7 +66,9 @@ def test_legacy_keys_migrated(tmp_path: Path) -> None:
     settings, loaded_path = load_settings(config_path)
 
     assert loaded_path == config_path
-    assert settings.transports.telegram.chat_id == 123
+    telegram = settings.transports.telegram
+    assert telegram is not None
+    assert telegram.chat_id == 123
     raw = read_config(config_path)
     assert "bot_token" not in raw
     assert "chat_id" not in raw

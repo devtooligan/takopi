@@ -93,6 +93,8 @@ def build_bot_commands(
         seen.add("file")
     if "cancel" not in seen:
         commands.append({"command": "cancel", "description": "cancel run"})
+    if "squash" not in seen:
+        commands.append({"command": "squash", "description": "combine queued messages"})
     if len(commands) > _MAX_BOT_COMMANDS:
         logger.warning(
             "startup.command_menu.too_many",

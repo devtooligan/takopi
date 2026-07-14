@@ -99,6 +99,12 @@ class TelegramFilesSettings(BaseModel):
         return value
 
 
+class TelegramQueueSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    combine: bool = False
+
+
 class TelegramTransportSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -117,6 +123,7 @@ class TelegramTransportSettings(BaseModel):
     media_group_debounce_s: float = Field(default=1.0, ge=0)
     topics: TelegramTopicsSettings = Field(default_factory=TelegramTopicsSettings)
     files: TelegramFilesSettings = Field(default_factory=TelegramFilesSettings)
+    queue: TelegramQueueSettings = Field(default_factory=TelegramQueueSettings)
 
 
 class TransportsSettings(BaseModel):

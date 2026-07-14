@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 from collections.abc import Awaitable, Callable
 
@@ -25,6 +25,13 @@ class ThreadJob:
     thread_id: ThreadId | None = None
     session_key: tuple[int, int | None] | None = None
     progress_ref: MessageRef | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SquashResult:
+    job: ThreadJob
+    dropped_progress_refs: list[MessageRef]
+    merged_count: int
 
 
 RunJob = Callable[[ThreadJob], Awaitable[None]]
@@ -58,8 +65,12 @@ class ThreadScheduler:
                 self._busy_until[key] = done
         self._task_group.start_soon(self._clear_busy, key, done)
 
-    async def enqueue(self, job: ThreadJob) -> None:
+    async def enqueue(
+        self, job: ThreadJob, *, combine: bool = False
+    ) -> SquashResult | None:
         key = self.thread_key(job.resume_token)
+        squash_result: SquashResult | None = None
+        start_worker = False
         async with self._lock:
             queue = self._pending_by_thread.get(key)
             if queue is None:
@@ -69,10 +80,15 @@ class ThreadScheduler:
             if job.progress_ref is not None:
                 progress_key = (job.chat_id, job.progress_ref.message_id)
                 self._queued_by_progress[progress_key] = job
+            if combine and len(queue) > 1:
+                squash_result = self._squash_queued_locked(job.resume_token)
             if key in self._active_threads:
-                return
+                return squash_result
             self._active_threads.add(key)
-        self._task_group.start_soon(self._thread_worker, key)
+            start_worker = True
+        if start_worker:
+            self._task_group.start_soon(self._thread_worker, key)
+        return squash_result
 
     async def enqueue_resume(
         self,
@@ -84,8 +100,9 @@ class ThreadScheduler:
         thread_id: ThreadId | None = None,
         session_key: tuple[int, int | None] | None = None,
         progress_ref: MessageRef | None = None,
-    ) -> None:
-        await self.enqueue(
+        combine: bool = False,
+    ) -> SquashResult | None:
+        return await self.enqueue(
             ThreadJob(
                 chat_id=chat_id,
                 user_msg_id=user_msg_id,
@@ -95,7 +112,8 @@ class ThreadScheduler:
                 thread_id=thread_id,
                 session_key=session_key,
                 progress_ref=progress_ref,
-            )
+            ),
+            combine=combine,
         )
 
     async def cancel_queued(
@@ -109,6 +127,41 @@ class ThreadScheduler:
     ) -> ThreadJob | None:
         async with self._lock:
             return self._pop_queued_locked(chat_id, progress_msg_id)
+
+    async def squash_queued(
+        self,
+        resume_token: ResumeToken,
+        *,
+        separator: str = "\n\n",
+    ) -> SquashResult | None:
+        async with self._lock:
+            return self._squash_queued_locked(resume_token, separator=separator)
+
+    async def squash_queued_by_progress(
+        self,
+        chat_id: ChannelId,
+        progress_msg_id: MessageId,
+        *,
+        separator: str = "\n\n",
+    ) -> SquashResult | None:
+        async with self._lock:
+            job = self._queued_by_progress.get((chat_id, progress_msg_id))
+            if job is None:
+                return None
+            return self._squash_queued_locked(job.resume_token, separator=separator)
+
+    async def queued_threads_for_chat(
+        self, chat_id: ChannelId, thread_id: ThreadId | None
+    ) -> list[ResumeToken]:
+        async with self._lock:
+            tokens: list[ResumeToken] = []
+            for queue in self._pending_by_thread.values():
+                if not queue:
+                    continue
+                head = queue[0]
+                if head.chat_id == chat_id and head.thread_id == thread_id:
+                    tokens.append(head.resume_token)
+            return tokens
 
     async def requeue_front(self, job: ThreadJob) -> None:
         key = self.thread_key(job.resume_token)
@@ -158,6 +211,39 @@ class ThreadScheduler:
         if not queue:
             self._pending_by_thread.pop(thread_key, None)
         return job
+
+    def _squash_queued_locked(
+        self,
+        resume_token: ResumeToken,
+        *,
+        separator: str = "\n\n",
+    ) -> SquashResult | None:
+        key = self.thread_key(resume_token)
+        queue = self._pending_by_thread.get(key)
+        if not queue:
+            return None
+        jobs = list(queue)
+        texts = [job.text for job in jobs if job.text.strip()]
+        merged = replace(jobs[0], text=separator.join(texts))
+        dropped: list[MessageRef] = []
+        for job in jobs:
+            if job.progress_ref is not None:
+                self._queued_by_progress.pop(
+                    (job.chat_id, job.progress_ref.message_id), None
+                )
+                if job is not jobs[0]:
+                    dropped.append(job.progress_ref)
+        queue.clear()
+        queue.append(merged)
+        if merged.progress_ref is not None:
+            self._queued_by_progress[
+                (merged.chat_id, merged.progress_ref.message_id)
+            ] = merged
+        return SquashResult(
+            job=merged,
+            dropped_progress_refs=dropped,
+            merged_count=len(jobs),
+        )
 
     async def _clear_busy(self, key: str, done: anyio.Event) -> None:
         await done.wait()
