@@ -35,6 +35,10 @@ from .commands.cancel import (
     handle_callback_steer,
     handle_cancel,
 )
+from .commands.queue import (
+    edit_squash_result,
+    handle_squash,
+)
 from .commands.file_transfer import FILE_PUT_USAGE
 from .commands.handlers import (
     dispatch_command,
@@ -1280,6 +1284,30 @@ async def run_main_loop(
 
             scheduler = ThreadScheduler(task_group=tg, run_job=run_thread_job)
 
+            async def enqueue_resume(
+                chat_id: int,
+                user_msg_id: int,
+                text: str,
+                resume_token: ResumeToken,
+                context: RunContext | None,
+                thread_id: int | None,
+                session_key: tuple[int, int | None] | None,
+                progress_ref: MessageRef | None,
+            ) -> None:
+                result = await scheduler.enqueue_resume(
+                    chat_id,
+                    user_msg_id,
+                    text,
+                    resume_token,
+                    context,
+                    thread_id,
+                    session_key,
+                    progress_ref,
+                    combine=cfg.queue.combine,
+                )
+                if result is not None:
+                    await edit_squash_result(cfg, result)
+
             def resolve_topic_key(
                 msg: TelegramIncomingMessage,
             ) -> tuple[int, int] | None:
@@ -1384,7 +1412,7 @@ async def run_main_loop(
                 cfg=cfg,
                 task_group=tg,
                 running_tasks=state.running_tasks,
-                enqueue_resume=scheduler.enqueue_resume,
+                enqueue_resume=enqueue_resume,
                 topic_store=state.topic_store,
                 chat_session_store=state.chat_session_store,
             )
@@ -1446,7 +1474,7 @@ async def run_main_loop(
                     context=context,
                     steerable=await scheduler.is_busy(resume_token),
                 )
-                await scheduler.enqueue_resume(
+                await enqueue_resume(
                     chat_id,
                     user_msg_id,
                     prompt_text,
@@ -1668,6 +1696,9 @@ async def run_main_loop(
 
                 command_id = classification.command_id
                 args_text = classification.args_text
+                if command_id == "squash":
+                    tg.start_soon(handle_squash, cfg, msg, scheduler)
+                    return
                 if command_id == "new":
                     forward_coalescer.cancel(forward_key)
                     if state.topic_store is not None and topic_key is not None:

@@ -15,7 +15,11 @@ import takopi.telegram.loop as telegram_loop
 import takopi.telegram.topics as telegram_topics
 from takopi.directives import parse_directives
 from takopi.telegram.api_models import Chat, File, ForumTopic, Message, Update, User
-from takopi.settings import TelegramFilesSettings, TelegramTopicsSettings
+from takopi.settings import (
+    TelegramFilesSettings,
+    TelegramQueueSettings,
+    TelegramTopicsSettings,
+)
 from takopi.telegram.bridge import (
     TelegramBridgeConfig,
     TelegramPresenter,
@@ -23,6 +27,7 @@ from takopi.telegram.bridge import (
     build_bot_commands,
     handle_callback_cancel,
     handle_cancel,
+    handle_squash,
     is_cancel_command,
     run_main_loop,
     send_with_resume,
@@ -170,6 +175,7 @@ def test_build_bot_commands_includes_cancel_and_engine() -> None:
     commands = build_bot_commands(runtime)
 
     assert {"command": "cancel", "description": "cancel run"} in commands
+    assert {"command": "squash", "description": "combine queued messages"} in commands
     assert {"command": "file", "description": "upload or fetch files"} in commands
     assert {"command": "new", "description": "start a new thread"} in commands
     assert {"command": "ctx", "description": "show or update context"} in commands
@@ -757,6 +763,153 @@ async def test_handle_cancel_cancels_queued_job() -> None:
     assert "cancelled" in cancelled_text
     assert "codex resume sid" in cancelled_text
     assert await scheduler.cancel_queued(123, progress_ref.message_id) is None
+
+
+@pytest.mark.anyio
+async def test_handle_squash_merges_queued_bubbles() -> None:
+    transport = FakeTransport()
+    cfg = make_cfg(transport)
+
+    async def _noop_run_job(_) -> None:
+        return None
+
+    scheduler = ThreadScheduler(task_group=_NoopTaskGroup(), run_job=_noop_run_job)
+    resume = ResumeToken(engine=CODEX_ENGINE, value="sid")
+    refs = [
+        MessageRef(channel_id=123, message_id=51),
+        MessageRef(channel_id=123, message_id=52),
+        MessageRef(channel_id=123, message_id=53),
+    ]
+    for index, (text, ref) in enumerate(
+        zip(["one", "two", "three"], refs, strict=True), start=1
+    ):
+        await scheduler.enqueue_resume(
+            chat_id=123,
+            user_msg_id=index,
+            text=text,
+            resume_token=resume,
+            progress_ref=ref,
+        )
+    msg = TelegramIncomingMessage(
+        transport="telegram",
+        chat_id=123,
+        message_id=10,
+        text="/squash",
+        reply_to_message_id=int(refs[1].message_id),
+        reply_to_text=None,
+        sender_id=123,
+    )
+
+    await handle_squash(cfg, msg, scheduler)
+
+    assert [call["ref"] for call in transport.edit_calls] == refs
+    assert "combined" in transport.edit_calls[0]["message"].text
+    assert "merged" in transport.edit_calls[1]["message"].text
+    assert "merged" in transport.edit_calls[2]["message"].text
+    queued = await scheduler.get_queued(123, refs[0].message_id)
+    assert queued is not None
+    assert queued.text == "one\n\ntwo\n\nthree"
+    assert await scheduler.get_queued(123, refs[1].message_id) is None
+    assert await scheduler.get_queued(123, refs[2].message_id) is None
+
+
+@pytest.mark.anyio
+async def test_handle_squash_in_combine_mode_replies_already_on() -> None:
+    transport = FakeTransport()
+    cfg = replace(make_cfg(transport), queue=TelegramQueueSettings(combine=True))
+
+    async def _noop_run_job(_) -> None:
+        return None
+
+    scheduler = ThreadScheduler(task_group=_NoopTaskGroup(), run_job=_noop_run_job)
+    resume = ResumeToken(engine=CODEX_ENGINE, value="sid")
+    ref = MessageRef(channel_id=123, message_id=51)
+    await scheduler.enqueue_resume(
+        chat_id=123,
+        user_msg_id=1,
+        text="one",
+        resume_token=resume,
+        progress_ref=ref,
+    )
+    msg = TelegramIncomingMessage(
+        transport="telegram",
+        chat_id=123,
+        message_id=10,
+        text="/squash",
+        reply_to_message_id=None,
+        reply_to_text=None,
+        sender_id=123,
+    )
+
+    await handle_squash(cfg, msg, scheduler)
+
+    assert not transport.edit_calls
+    assert "squash mode" in transport.send_calls[0]["message"].text
+    queued = await scheduler.get_queued(123, ref.message_id)
+    assert queued is not None
+    assert queued.text == "one"
+
+
+@pytest.mark.anyio
+async def test_handle_squash_no_reply_merges_current_thread() -> None:
+    transport = FakeTransport()
+    cfg = make_cfg(transport)
+
+    async def _noop_run_job(_) -> None:
+        return None
+
+    scheduler = ThreadScheduler(task_group=_NoopTaskGroup(), run_job=_noop_run_job)
+    resume = ResumeToken(engine=CODEX_ENGINE, value="sid")
+    first = MessageRef(channel_id=123, message_id=51)
+    second = MessageRef(channel_id=123, message_id=52)
+    await scheduler.enqueue_resume(
+        chat_id=123, user_msg_id=1, text="one", resume_token=resume, progress_ref=first
+    )
+    await scheduler.enqueue_resume(
+        chat_id=123, user_msg_id=2, text="two", resume_token=resume, progress_ref=second
+    )
+    msg = TelegramIncomingMessage(
+        transport="telegram",
+        chat_id=123,
+        message_id=10,
+        text="/squash",
+        reply_to_message_id=None,
+        reply_to_text=None,
+        sender_id=123,
+    )
+
+    await handle_squash(cfg, msg, scheduler)
+
+    merged = await scheduler.get_queued(123, first.message_id)
+    assert merged is not None and merged.text == "one\n\ntwo"
+    assert await scheduler.get_queued(123, second.message_id) is None
+
+
+@pytest.mark.anyio
+async def test_handle_squash_nonqueued_reply_says_nothing() -> None:
+    transport = FakeTransport()
+    cfg = make_cfg(transport)
+
+    async def _noop_run_job(_) -> None:
+        return None
+
+    scheduler = ThreadScheduler(task_group=_NoopTaskGroup(), run_job=_noop_run_job)
+    msg = TelegramIncomingMessage(
+        transport="telegram",
+        chat_id=123,
+        message_id=10,
+        text="/squash",
+        reply_to_message_id=99,
+        reply_to_text=None,
+        sender_id=123,
+    )
+
+    await handle_squash(cfg, msg, scheduler)
+
+    assert transport.send_calls
+    assert (
+        transport.send_calls[0]["message"].text.strip() == "nothing queued to squash."
+    )
 
 
 @pytest.mark.anyio
@@ -1944,6 +2097,80 @@ async def test_run_engine_hides_resume_line_in_topics() -> None:
 
     assert transport.last_message is not None
     assert "resume-123" not in transport.last_message.text
+
+
+async def _run_busy_queue_messages(
+    *,
+    queue_combine: bool,
+    messages: list[str],
+) -> tuple[ScriptRunner, FakeTransport]:
+    progress_ready = anyio.Event()
+    stop_polling = anyio.Event()
+    hold = anyio.Event()
+    transport = FakeTransport(progress_ready=progress_ready)
+    runner = ScriptRunner(
+        [Wait(hold), Return(answer="ok")],
+        engine=CODEX_ENGINE,
+        resume_value="abc123",
+    )
+    cfg = replace(
+        make_cfg(transport, runner),
+        queue=TelegramQueueSettings(combine=queue_combine),
+    )
+
+    async def poller(_cfg: TelegramBridgeConfig):
+        yield TelegramIncomingMessage(
+            transport="telegram",
+            chat_id=123,
+            message_id=1,
+            text="first",
+            reply_to_message_id=None,
+            reply_to_text=None,
+            sender_id=123,
+        )
+        await progress_ready.wait()
+        assert transport.progress_ref is not None
+        assert isinstance(transport.progress_ref.message_id, int)
+        reply_id = transport.progress_ref.message_id
+        for message_id, text in enumerate(messages, start=2):
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=123,
+                message_id=message_id,
+                text=text,
+                reply_to_message_id=reply_id,
+                reply_to_text=None,
+                sender_id=123,
+            )
+        await stop_polling.wait()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(run_main_loop, cfg, poller)
+        try:
+            with anyio.fail_after(2):
+                while len(transport.send_calls) < len(messages) + 1:
+                    await anyio.sleep(0)
+            hold.set()
+            with anyio.fail_after(2):
+                while len(runner.calls) < 2:
+                    await anyio.sleep(0)
+        finally:
+            hold.set()
+            stop_polling.set()
+            tg.cancel_scope.cancel()
+
+    return runner, transport
+
+
+@pytest.mark.anyio
+async def test_queue_combine_merges_new_followups() -> None:
+    runner, transport = await _run_busy_queue_messages(
+        queue_combine=True,
+        messages=["one", "two", "three"],
+    )
+
+    assert runner.calls[1][0] == "one\n\ntwo\n\nthree"
+    assert any("merged" in call["message"].text for call in transport.edit_calls)
 
 
 @pytest.mark.anyio
