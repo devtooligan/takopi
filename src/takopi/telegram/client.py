@@ -22,6 +22,12 @@ from .parsing import parse_incoming_update, poll_incoming
 
 logger = get_logger(__name__)
 
+# Upper bound on how long a single Telegram call will keep retrying on
+# transient failures (network timeouts, 429s) before giving up and returning
+# None. Without this, a sustained Telegram outage makes any call retry forever
+# and wedges the message-handling pipeline.
+_RETRY_DEADLINE_S = 60.0
+
 __all__ = [
     "BotClient",
     "TelegramClient",
@@ -131,11 +137,20 @@ class TelegramClient:
         self,
         fn: Callable[[], Awaitable[Any]],
     ) -> Any:
+        deadline = self._clock() + _RETRY_DEADLINE_S
         while True:
             try:
                 return await fn()
             except TelegramRetryAfter as exc:
-                await self._sleep(exc.retry_after)
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    logger.warning(
+                        "telegram.retry_after.giving_up",
+                        retry_after=exc.retry_after,
+                        error=exc.description,
+                    )
+                    return None
+                await self._sleep(min(exc.retry_after, remaining))
 
     async def get_updates(
         self,
