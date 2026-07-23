@@ -7,11 +7,20 @@ from collections.abc import Awaitable, Callable, Hashable
 
 import anyio
 
+from ..logging import get_logger
 from .client_api import RetryAfter
+
+logger = get_logger(__name__)
 
 SEND_PRIORITY = 0
 DELETE_PRIORITY = 1
 EDIT_PRIORITY = 2
+
+# Upper bound on how long a queued op keeps retrying on transient failures
+# before it is dropped with a None result. Without this, a sustained Telegram
+# outage makes the outbox requeue an op forever, blocking every caller awaiting
+# a send/edit/delete (e.g. the initial progress message before a runner starts).
+_OP_RETRY_DEADLINE_S = 60.0
 
 
 @dataclass(slots=True)
@@ -148,14 +157,26 @@ class TelegramOutbox:
                     result = await self.execute_op(op)
                 except RetryAfter as exc:
                     self.retry_at = max(self.retry_at, self._clock() + exc.retry_after)
+                    # Give up if the next retry would fall past the op's deadline,
+                    # so a caller awaiting the result is never blocked much beyond
+                    # it. A large server-supplied retry_after (flood-wait) must not
+                    # stall the pipeline waiting for a send that will be dropped.
+                    expired = self.retry_at - op.queued_at >= _OP_RETRY_DEADLINE_S
                     async with self._cond:
-                        if self._closed:
+                        if self._closed or expired:
                             op.set_result(None)
                         elif key not in self._pending:
                             self._pending[key] = op
                             self._cond.notify()
                         else:
                             op.set_result(None)
+                    if expired and not self._closed:
+                        logger.warning(
+                            "telegram.outbox.giving_up",
+                            method=op.label,
+                            retry_after=exc.retry_after,
+                            error=exc.description,
+                        )
                     continue
                 self.next_at = started_at + self._interval_for_chat(op.chat_id)
                 op.set_result(result)

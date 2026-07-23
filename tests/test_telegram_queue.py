@@ -448,3 +448,80 @@ async def test_get_updates_retries_on_retry_after() -> None:
 
     assert updates == []
     assert bot._updates_attempts == 2
+
+
+class GiveUpBot(FakeBot):
+    """Always raises TelegramRetryAfter, simulating a sustained Telegram outage.
+
+    ``_MAX_ATTEMPTS`` is a tripwire: if a give-up deadline ever regresses to an
+    unbounded retry loop, the test fails loudly instead of hanging (there is no
+    global pytest timeout configured).
+    """
+
+    _MAX_ATTEMPTS = 10_000
+
+    def __init__(self, retry_after: float = 2.0) -> None:
+        super().__init__()
+        self.give_up_retry_after = retry_after
+
+    async def get_updates(self, *args: Any, **kwargs: Any) -> Any:
+        self._updates_attempts += 1
+        assert self._updates_attempts < self._MAX_ATTEMPTS, "retry loop did not stop"
+        raise TelegramRetryAfter(self.give_up_retry_after)
+
+    async def edit_message_text(self, *args: Any, **kwargs: Any) -> Any:
+        self._edit_attempts += 1
+        assert self._edit_attempts < self._MAX_ATTEMPTS, "retry loop did not stop"
+        raise TelegramRetryAfter(self.give_up_retry_after)
+
+
+@pytest.mark.anyio
+async def test_get_updates_gives_up_after_deadline() -> None:
+    now = [0.0]
+
+    async def fake_sleep(delay: float) -> None:
+        now[0] += delay
+
+    # retry_after far larger than the 60s deadline: the sleep must be clamped to
+    # the remaining deadline, not the server-supplied value.
+    bot = GiveUpBot(retry_after=1000.0)
+    client = TelegramClient(
+        client=bot,
+        clock=lambda: now[0],
+        sleep=fake_sleep,
+        private_chat_rps=0.0,
+        group_chat_rps=0.0,
+    )
+
+    with anyio.fail_after(1):
+        result = await client.get_updates(offset=None, timeout_s=0)
+
+    assert result is None
+    assert bot._updates_attempts == 2
+    assert now[0] == 60.0  # slept only the remaining deadline, not 1000s
+
+
+@pytest.mark.anyio
+async def test_outbox_drops_op_after_deadline() -> None:
+    now = [0.0]
+
+    async def fake_sleep(delay: float) -> None:
+        now[0] += delay
+
+    # small retry_after: the op is requeued many times and dropped once its next
+    # retry would fall past the 60s deadline.
+    bot = GiveUpBot(retry_after=2.0)
+    client = TelegramClient(
+        client=bot,
+        clock=lambda: now[0],
+        sleep=fake_sleep,
+        private_chat_rps=0.0,
+        group_chat_rps=0.0,
+    )
+
+    result = await client.edit_message_text(chat_id=1, message_id=1, text="x")
+
+    assert result is None
+    assert bot._edit_attempts >= 2
+    assert now[0] >= 56.0  # retried for ~the full deadline before giving up
+    await client.close()
